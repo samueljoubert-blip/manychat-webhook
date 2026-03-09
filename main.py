@@ -411,6 +411,19 @@ async def process_comment(comment_id: str, commenter_id: str, comment_text: str,
     """
     logger.info(f"[{platform}] Comment from {commenter_id} on {media_id}: {comment_text}")
 
+    # Test keyword — for testing without ManyChat interference
+    if comment_text.strip().lower() == "testcdg":
+        await reply_to_comment(comment_id, platform)
+        await send_text_message(
+            commenter_id,
+            "🎉 BRAVO ! Many Coup de Grace fonctionne parfaitement !\n\n"
+            "Ce message vient de TON serveur, pas de ManyChat.\n"
+            "Tu peux maintenant annuler ton abonnement ManyChat! 💪",
+            platform,
+        )
+        logger.info("TEST comment keyword matched — replied + DM sent")
+        return
+
     # Try to match a recipe keyword (fuzzy)
     recipe = fuzzy_lookup_recipe(comment_text)
 
