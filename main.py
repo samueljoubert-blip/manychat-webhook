@@ -9,8 +9,10 @@ import os
 import re
 import hmac
 import hashlib
+import random
 import sqlite3
 import logging
+import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Optional
@@ -23,7 +25,7 @@ from fastapi.responses import PlainTextResponse
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
-app = FastAPI(title="Many Coup de Grace — LCDG", version="2.0.0")
+app = FastAPI(title="Many Coup de Grace — LCDG", version="3.0.0")
 
 app.add_middleware(
     CORSMiddleware,
@@ -130,6 +132,308 @@ def lookup_recipe(keyword: str) -> Optional[dict]:
         "keyword": row["keyword"],
         "image_url": row["image_url"] or "",
     }
+
+
+# ---------------------------------------------------------------------------
+# Smart matching — Fuzzy + Natural Language Search
+# ---------------------------------------------------------------------------
+def strip_accents(text: str) -> str:
+    """Remove accents from text (e→e, a→a, etc.)."""
+    nfkd = unicodedata.normalize("NFKD", text)
+    return "".join(c for c in nfkd if not unicodedata.category(c).startswith("M"))
+
+
+def normalize_keyword(text: str) -> str:
+    """Normalize a keyword: lowercase, strip accents, remove non-alphanumeric."""
+    text = text.lower().strip()
+    text = strip_accents(text)
+    return re.sub(r"[^a-z0-9]", "", text)
+
+
+def levenshtein_distance(s1: str, s2: str) -> int:
+    """Compute Levenshtein distance between two strings (pure Python)."""
+    if len(s1) < len(s2):
+        return levenshtein_distance(s2, s1)
+    if len(s2) == 0:
+        return len(s1)
+    prev_row = list(range(len(s2) + 1))
+    for i, c1 in enumerate(s1):
+        curr_row = [i + 1]
+        for j, c2 in enumerate(s2):
+            insertions = prev_row[j + 1] + 1
+            deletions = curr_row[j] + 1
+            substitutions = prev_row[j] + (c1 != c2)
+            curr_row.append(min(insertions, deletions, substitutions))
+        prev_row = curr_row
+    return prev_row[-1]
+
+
+def get_all_keywords() -> list:
+    """Get all recipes with keywords from bible.db."""
+    conn = get_bible_db()
+    rows = conn.execute(
+        "SELECT title, url, keyword, image_url FROM recipes "
+        "WHERE wpml_lang='fr' AND keyword IS NOT NULL AND keyword != ''"
+    ).fetchall()
+    conn.close()
+    return [
+        {
+            "title": row["title"],
+            "url": row["url"],
+            "keyword": row["keyword"],
+            "image_url": row["image_url"] or "",
+        }
+        for row in rows
+    ]
+
+
+def fuzzy_lookup_recipe(text: str) -> Optional[dict]:
+    """
+    Smart recipe lookup with multiple matching strategies:
+    1. Exact keyword match (case-insensitive)
+    2. Normalized match (strip accents, spaces, special chars)
+    3. Partial match (keyword contains text or vice versa)
+    4. Fuzzy match (Levenshtein distance tolerance)
+    """
+    text_lower = text.lower().strip()
+    text_clean = re.sub(r"[^a-zA-Z0-9\u00e0\u00e2\u00e4\u00e9\u00e8\u00ea\u00eb\u00ef\u00ee\u00f4\u00f9\u00fb\u00fc\u00ff\u00e7\u0153\u00e6]", "", text_lower)
+    text_normalized = normalize_keyword(text)
+
+    # Strategy 1: Exact match
+    recipe = lookup_recipe(text_clean)
+    if recipe:
+        return recipe
+    recipe = lookup_recipe(text_lower)
+    if recipe:
+        return recipe
+
+    # Load all keywords for fuzzy matching
+    all_recipes = get_all_keywords()
+
+    # Strategy 2: Normalized match (strip accents from both sides)
+    for r in all_recipes:
+        kw_normalized = normalize_keyword(r["keyword"])
+        if kw_normalized and kw_normalized == text_normalized:
+            logger.info(f"Normalized match: '{text}' -> '{r['keyword']}'")
+            return r
+
+    # Strategy 3: Partial match (one contains the other, 4+ chars min)
+    if len(text_normalized) >= 4:
+        partial_matches = []
+        for r in all_recipes:
+            kw_normalized = normalize_keyword(r["keyword"])
+            if not kw_normalized:
+                continue
+            if text_normalized in kw_normalized or kw_normalized in text_normalized:
+                len_diff = abs(len(kw_normalized) - len(text_normalized))
+                partial_matches.append((r, len_diff))
+        if partial_matches:
+            partial_matches.sort(key=lambda x: x[1])
+            best = partial_matches[0]
+            logger.info(f"Partial match: '{text}' -> '{best[0]['keyword']}' (len_diff={best[1]})")
+            return best[0]
+
+    # Strategy 4: Fuzzy match (Levenshtein distance)
+    if len(text_normalized) >= 3:
+        best_match = None
+        best_distance = float("inf")
+        for r in all_recipes:
+            kw_normalized = normalize_keyword(r["keyword"])
+            if not kw_normalized:
+                continue
+            # Skip if lengths are too different
+            if abs(len(kw_normalized) - len(text_normalized)) > 3:
+                continue
+            dist = levenshtein_distance(text_normalized, kw_normalized)
+            # Tolerance: 1 for short (<=5), 2 for medium (<=10), 3 for long
+            max_tol = 1 if len(text_normalized) <= 5 else (2 if len(text_normalized) <= 10 else 3)
+            if dist <= max_tol and dist < best_distance:
+                best_distance = dist
+                best_match = r
+        if best_match:
+            logger.info(f"Fuzzy match: '{text}' -> '{best_match['keyword']}' (distance={best_distance})")
+            return best_match
+
+    return None
+
+
+# ---------------------------------------------------------------------------
+# Natural language search
+# ---------------------------------------------------------------------------
+FRENCH_STOP_WORDS = {
+    "de", "la", "le", "les", "du", "des", "un", "une", "au", "aux",
+    "et", "ou", "en", "a", "avec", "pour", "dans", "sur", "par",
+    "mon", "ma", "mes", "ton", "ta", "tes", "son", "sa", "ses",
+    "ce", "cette", "ces", "qui", "que", "quoi", "dont",
+    "je", "tu", "il", "elle", "on", "nous", "vous", "ils", "elles",
+    "moi", "toi", "lui", "eux", "y", "ne", "pas", "plus",
+    "recette", "recettes", "faire", "comment", "bonne", "bon",
+    "meilleur", "meilleure", "meilleures", "meilleurs",
+    "veux", "voudrais", "cherche", "donne", "envoi", "envoie",
+    "mets", "plat", "plats", "quelque", "chose", "truc", "tres",
+}
+
+CATEGORY_SYNONYMS = {
+    "viande": ["poulet", "boeuf", "porc", "veau", "agneau", "steak", "filet",
+               "cote", "roti", "braise", "grille", "bbq", "barbecue", "burger",
+               "saucisse", "bacon", "jambon", "dinde", "canard"],
+    "poisson": ["saumon", "thon", "morue", "crevette", "crevettes", "tilapia",
+                "truite", "homard", "crabe", "fruits de mer", "poissons",
+                "cabillaud", "aiglefin", "sole"],
+    "dessert": ["gateau", "tarte", "biscuit", "chocolat", "creme", "mousse",
+                "brownie", "muffin", "cookie", "cupcake", "fondant",
+                "sucre", "sucree", "caramel", "vanille", "fraise", "citron"],
+    "soupe": ["potage", "veloute", "bouillon", "chowder", "soupes"],
+    "salade": ["salades", "coleslaw", "vinaigrette", "cesar"],
+    "pates": ["spaghetti", "linguine", "fettuccine", "penne", "macaroni",
+              "lasagne", "gnocchi", "ravioli", "pasta", "nouille", "nouilles"],
+    "legumes": ["brocoli", "carotte", "patate", "courgette", "aubergine",
+                "tomate", "oignon", "champignon", "epinard", "chou",
+                "haricot", "pois", "mais", "celeri", "poivron"],
+    "dejeuner": ["oeuf", "oeufs", "crepe", "crepes", "pain", "toast",
+                 "granola", "smoothie", "brunch", "omelette", "quiche"],
+    "mexicain": ["taco", "tacos", "burrito", "nachos", "quesadilla",
+                 "guacamole", "salsa", "enchilada", "fajita"],
+    "asiatique": ["sushi", "ramen", "pad thai", "curry", "wok",
+                  "teriyaki", "dumpling", "bibimbap"],
+    "italien": ["pizza", "risotto", "pesto", "bolognaise", "carbonara",
+                "bruschetta", "antipasto", "tiramisu", "prosciutto"],
+    "rapide": ["facile", "simple", "vite", "minute", "express",
+               "semaine", "soir", "lunch"],
+}
+
+
+def search_recipes_by_text(query: str, limit: int = 5) -> list:
+    """
+    Search recipes by natural language query.
+    Searches in recipe titles and keywords, expands category synonyms.
+    Returns scored results.
+    """
+    query_norm = strip_accents(query.lower().strip())
+    words = re.split(r"[^a-z0-9]+", query_norm)
+    search_terms = [w for w in words if w not in FRENCH_STOP_WORDS and len(w) > 1]
+
+    if not search_terms:
+        return []
+
+    # Expand with category synonyms
+    expanded_terms = list(search_terms)
+    for term in search_terms:
+        if term in CATEGORY_SYNONYMS:
+            expanded_terms.extend(CATEGORY_SYNONYMS[term])
+    expanded_terms = list(set(expanded_terms))
+
+    # Get all FR recipes
+    conn = get_bible_db()
+    rows = conn.execute(
+        "SELECT title, url, keyword, image_url FROM recipes WHERE wpml_lang='fr'"
+    ).fetchall()
+    conn.close()
+
+    # Score each recipe
+    results = []
+    for row in rows:
+        title_norm = strip_accents(row["title"].lower()) if row["title"] else ""
+        keyword_norm = strip_accents((row["keyword"] or "").lower())
+        score = 0
+        matched = []
+        for term in expanded_terms:
+            in_title = term in title_norm
+            in_kw = term in keyword_norm
+            if in_title:
+                score += 3 if term in search_terms else 2
+                matched.append(term)
+            if in_kw:
+                score += 2 if term in search_terms else 1
+                if term not in matched:
+                    matched.append(term)
+        if score > 0:
+            results.append({
+                "title": row["title"],
+                "url": row["url"],
+                "keyword": row["keyword"] or "",
+                "image_url": row["image_url"] or "",
+                "score": score,
+            })
+
+    results.sort(key=lambda x: x["score"], reverse=True)
+    return results[:limit]
+
+
+# ---------------------------------------------------------------------------
+# Comment auto-reply — Public replies (random)
+# ---------------------------------------------------------------------------
+COMMENT_PUBLIC_REPLIES = [
+    "Va jeter un \u0153il, c'est dans tes DM ! \U0001f440",
+    "Ouvre tes DM, c'est l\u00e0 ! \U0001f60d",
+    "C'est fait ! Va voir tes messages priv\u00e9s ! \U0001f4f2",
+]
+
+
+async def reply_to_comment(comment_id: str, platform: str = "instagram"):
+    """Reply publicly to a comment with a random message."""
+    reply_text = random.choice(COMMENT_PUBLIC_REPLIES)
+    token = INSTAGRAM_PAGE_ACCESS_TOKEN if platform == "instagram" else FACEBOOK_PAGE_ACCESS_TOKEN
+    if not token:
+        logger.error(f"No access token for comment reply on {platform}")
+        return None
+
+    # Instagram: POST /{comment-id}/replies  |  Facebook: POST /{comment-id}/comments
+    endpoint = "replies" if platform == "instagram" else "comments"
+    async with httpx.AsyncClient(timeout=15) as client:
+        resp = await client.post(
+            f"{GRAPH_API_BASE}/{comment_id}/{endpoint}",
+            params={"access_token": token},
+            json={"message": reply_text},
+        )
+        if resp.status_code != 200:
+            logger.error(f"Comment reply failed: {resp.status_code} {resp.text}")
+        else:
+            logger.info(f"Replied to comment {comment_id}: {reply_text}")
+        return resp.json() if resp.status_code == 200 else None
+
+
+async def send_dm_from_comment(user_id: str, recipe: dict, platform: str = "instagram"):
+    """Send a DM to someone who commented a keyword on a post."""
+    # Send the recipe card via DM
+    result = await send_recipe_card(user_id, recipe, platform)
+    if result:
+        logger.info(f"Sent DM recipe '{recipe['keyword']}' to commenter {user_id} on {platform}")
+    return result
+
+
+async def process_comment(comment_id: str, commenter_id: str, comment_text: str,
+                          media_id: str, platform: str):
+    """
+    Process a comment on a post.
+    If the comment matches a keyword, reply publicly + send DM with recipe.
+    """
+    logger.info(f"[{platform}] Comment from {commenter_id} on {media_id}: {comment_text}")
+
+    # Try to match a recipe keyword (fuzzy)
+    recipe = fuzzy_lookup_recipe(comment_text)
+
+    if not recipe:
+        # Also try natural language search — take top result if score is high
+        results = search_recipes_by_text(comment_text, limit=1)
+        if results and results[0]["score"] >= 4:
+            recipe = results[0]
+
+    if recipe:
+        # 1. Reply publicly to the comment (random message)
+        await reply_to_comment(comment_id, platform)
+
+        # 2. Send DM with the recipe
+        await send_dm_from_comment(commenter_id, recipe, platform)
+
+        # 3. Register as subscriber
+        sub_id = upsert_subscriber(commenter_id, platform)
+        log_message(sub_id, "incoming", f"[COMMENT] {comment_text}",
+                    keyword_matched=recipe["keyword"], platform=platform)
+        log_message(sub_id, "outgoing", f"[COMMENT REPLY+DM] {recipe['title']}",
+                    keyword_matched=recipe["keyword"], platform=platform)
+    else:
+        logger.info(f"Comment '{comment_text}' did not match any keyword — ignored")
 
 
 # ---------------------------------------------------------------------------
@@ -323,9 +627,38 @@ def verify_signature(body: bytes, signature: str) -> bool:
 EMAIL_REGEX = re.compile(r"[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}")
 
 
+async def _maybe_ask_email_or_optin(sender_psid: str, platform: str):
+    """After sending a recipe, ask for email or broadcast opt-in if needed."""
+    conn = get_subscribers_db()
+    sub = conn.execute(
+        "SELECT email, opted_in_broadcast FROM subscribers WHERE psid = ? AND platform = ?",
+        (sender_psid, platform),
+    ).fetchone()
+    conn.close()
+
+    if not sub:
+        return
+    if not sub["email"]:
+        set_conversation_state(sender_psid, platform, "waiting_email")
+        await send_text_message(
+            sender_psid,
+            "Tu veux recevoir nos meilleures recettes par courriel ? "
+            "Envoie-moi ton email ! (ou reponds NON pour passer)",
+            platform,
+        )
+    elif not sub["opted_in_broadcast"]:
+        set_conversation_state(sender_psid, platform, "waiting_optin")
+        await send_text_message(
+            sender_psid,
+            "Veux-tu recevoir un message quand une nouvelle recette sort ? "
+            "Reponds OUI ou NON !",
+            platform,
+        )
+
+
 async def process_incoming_message(sender_psid: str, page_id: str,
                                     message_text: str, platform: str):
-    """Process an incoming DM and respond accordingly."""
+    """Process an incoming DM with smart fuzzy matching + natural language search."""
     logger.info(f"[{platform}] Message from {sender_psid}: {message_text}")
 
     # 1. Upsert subscriber
@@ -390,53 +723,48 @@ async def process_incoming_message(sender_psid: str, page_id: str,
             return
         # If neither yes/no, treat as keyword (fall through)
 
-    # 3. Try to match a recipe keyword
-    # Clean the keyword (remove spaces, special chars for matching)
-    keyword_clean = re.sub(r"[^a-zA-Z0-9àâäéèêëïîôùûüÿçœæ]", "", text_lower)
-    recipe = lookup_recipe(keyword_clean)
-
-    if not recipe:
-        # Also try the raw text (some keywords might have special formatting)
-        recipe = lookup_recipe(text_lower)
+    # 3. Smart recipe matching — Fuzzy keyword lookup
+    recipe = fuzzy_lookup_recipe(message_text)
 
     if recipe:
-        # Send recipe card
+        # Single recipe found — send rich card
         await send_recipe_card(sender_psid, recipe, platform)
-        log_message(sub_id, "outgoing", f"Recipe: {recipe['title']}", keyword_matched=recipe["keyword"], platform=platform)
+        log_message(sub_id, "outgoing", f"Recipe: {recipe['title']}",
+                    keyword_matched=recipe["keyword"], platform=platform)
+        await _maybe_ask_email_or_optin(sender_psid, platform)
+        return
 
-        # Ask for email if we don't have one yet
-        conn = get_subscribers_db()
-        sub = conn.execute(
-            "SELECT email, opted_in_broadcast FROM subscribers WHERE psid = ? AND platform = ?",
-            (sender_psid, platform),
-        ).fetchone()
-        conn.close()
+    # 4. No keyword match — try natural language search
+    search_results = search_recipes_by_text(message_text, limit=5)
 
-        if not sub["email"]:
-            set_conversation_state(sender_psid, platform, "waiting_email")
-            await send_text_message(
-                sender_psid,
-                "Tu veux recevoir nos meilleures recettes par courriel ? "
-                "Envoie-moi ton email ! (ou reponds NON pour passer)",
-                platform,
-            )
-        elif not sub["opted_in_broadcast"]:
-            set_conversation_state(sender_psid, platform, "waiting_optin")
-            await send_text_message(
-                sender_psid,
-                "Veux-tu recevoir un message quand une nouvelle recette sort ? "
-                "Reponds OUI ou NON !",
-                platform,
-            )
-    else:
-        # No recipe found
-        await send_text_message(
-            sender_psid,
-            "Desole, je n'ai pas trouve de recette pour ce mot-cle.\n\n"
-            "Essaie un autre mot-cle ou visite lecoupdegrace.ca pour explorer nos recettes !",
-            platform,
-        )
-        log_message(sub_id, "outgoing", "Not found", keyword_matched=message_text, platform=platform)
+    if search_results:
+        # Send top result as rich card
+        top = search_results[0]
+        await send_recipe_card(sender_psid, top, platform)
+
+        # If multiple results, send text list of the rest
+        if len(search_results) > 1:
+            lines = ["Voici d'autres recettes qui pourraient t'interesser :\n"]
+            for i, r in enumerate(search_results[1:], 2):
+                lines.append(f"{i}. {r['title']}")
+                lines.append(f"   {r['url']}\n")
+            await send_text_message(sender_psid, "\n".join(lines), platform)
+
+        log_message(sub_id, "outgoing",
+                    f"Search: {len(search_results)} results for '{message_text}'",
+                    keyword_matched=message_text, platform=platform)
+        await _maybe_ask_email_or_optin(sender_psid, platform)
+        return
+
+    # 5. Nothing found at all
+    await send_text_message(
+        sender_psid,
+        "Desole, je n'ai pas trouve de recette pour \"" + message_text + "\".\n\n"
+        "Essaie un autre mot-cle ou visite lecoupdegrace.ca pour explorer nos recettes !",
+        platform,
+    )
+    log_message(sub_id, "outgoing", "Not found",
+                keyword_matched=message_text, platform=platform)
 
 
 # ---------------------------------------------------------------------------
@@ -486,7 +814,8 @@ async def webhook_receive(request: Request):
 
     # Process each entry
     for entry in data.get("entry", []):
-        # Instagram uses "messaging", Facebook uses "messaging" too
+
+        # --- DM messages (Instagram + Facebook Messenger) ---
         messaging_events = entry.get("messaging", [])
         for event in messaging_events:
             sender_psid = event.get("sender", {}).get("id", "")
@@ -508,6 +837,32 @@ async def webhook_receive(request: Request):
                 payload = event["postback"].get("payload", "")
                 if payload:
                     await process_incoming_message(sender_psid, page_id, payload, platform)
+
+        # --- Comment events (Instagram + Facebook) ---
+        changes = entry.get("changes", [])
+        for change in changes:
+            field = change.get("field", "")
+            value = change.get("value", {})
+
+            # Instagram comments
+            if field == "comments" and platform == "instagram":
+                comment_id = value.get("id", "")
+                comment_text = value.get("text", "")
+                commenter_id = value.get("from", {}).get("id", "")
+                media_id = value.get("media", {}).get("id", "")
+                if comment_id and commenter_id and comment_text:
+                    await process_comment(comment_id, commenter_id, comment_text,
+                                          media_id, platform)
+
+            # Facebook feed comments
+            elif field == "feed" and value.get("item") == "comment":
+                comment_id = value.get("comment_id", "")
+                comment_text = value.get("message", "")
+                commenter_id = value.get("from", {}).get("id", "")
+                post_id = value.get("post_id", "")
+                if comment_id and commenter_id and comment_text:
+                    await process_comment(comment_id, commenter_id, comment_text,
+                                          post_id, "facebook")
 
     # Always return 200 OK quickly
     return {"status": "ok"}
@@ -660,7 +1015,7 @@ async def list_broadcasts():
 # ---------------------------------------------------------------------------
 @app.get("/")
 async def root():
-    return {"status": "ok", "service": "Many Coup de Grace — lecoupdegrace.ca", "version": "2.0.0"}
+    return {"status": "ok", "service": "Many Coup de Grace — lecoupdegrace.ca", "version": "3.0.0"}
 
 
 @app.get("/health")
@@ -697,11 +1052,32 @@ async def manychat_webhook(request: Request):
     if not keyword:
         return {"error": "missing_keyword", "message": "Le champ 'keyword' est requis."}
 
-    recipe = lookup_recipe(keyword)
+    recipe = fuzzy_lookup_recipe(keyword)
     if not recipe:
-        return {"error": "not_found", "message": f"Aucune recette trouvee pour le keyword '{keyword}'."}
+        # Try natural language search as last resort
+        results = search_recipes_by_text(keyword, limit=1)
+        if results:
+            recipe = results[0]
+        else:
+            return {"error": "not_found", "message": f"Aucune recette trouvee pour le keyword '{keyword}'."}
 
     return recipe
+
+
+@app.get("/search")
+async def search_recipes(q: str = Query("", description="Search query")):
+    """Search recipes by keyword (fuzzy) or natural language."""
+    if not q.strip():
+        return {"results": [], "method": "none"}
+
+    # Try fuzzy keyword match first
+    recipe = fuzzy_lookup_recipe(q)
+    if recipe:
+        return {"results": [recipe], "method": "fuzzy_keyword", "query": q}
+
+    # Fall back to natural language search
+    results = search_recipes_by_text(q, limit=10)
+    return {"results": results, "method": "natural_language", "query": q, "total": len(results)}
 
 
 @app.get("/manychat/keywords")
