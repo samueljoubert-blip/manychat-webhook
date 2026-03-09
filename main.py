@@ -40,11 +40,12 @@ logger = logging.getLogger("many-cdg")
 DB_PATH = Path(os.getenv("BIBLE_DB_PATH", "./bible.db"))
 SUBSCRIBERS_DB_PATH = Path(os.getenv("SUBSCRIBERS_DB_PATH", "./subscribers.db"))
 
-WEBHOOK_VERIFY_TOKEN = os.getenv("WEBHOOK_VERIFY_TOKEN", "")
-FACEBOOK_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET", "")
-FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "")
+WEBHOOK_VERIFY_TOKEN = os.getenv("WEBHOOK_VERIFY_TOKEN", "").strip()
+FACEBOOK_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET", "").strip()
+FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
 # Instagram uses same Page token by default (same FB Page linked to IG account)
-INSTAGRAM_PAGE_ACCESS_TOKEN = os.getenv("INSTAGRAM_PAGE_ACCESS_TOKEN", "") or FACEBOOK_PAGE_ACCESS_TOKEN
+INSTAGRAM_PAGE_ACCESS_TOKEN = (os.getenv("INSTAGRAM_PAGE_ACCESS_TOKEN", "").strip()
+                               or FACEBOOK_PAGE_ACCESS_TOKEN)
 
 GRAPH_API_VERSION = "v21.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
@@ -623,20 +624,30 @@ async def send_recipe_card(psid: str, recipe: dict, platform: str = "instagram")
 # ---------------------------------------------------------------------------
 def verify_signature(body: bytes, signature: str) -> bool:
     """Verify X-Hub-Signature-256 from Meta."""
-    if not FACEBOOK_APP_SECRET or not signature:
-        return True  # Skip verification if no secret configured (dev mode)
+    if not FACEBOOK_APP_SECRET:
+        logger.warning("No APP_SECRET configured — skipping signature check")
+        return True
+    if not signature:
+        logger.warning("No X-Hub-Signature-256 header — skipping signature check")
+        return True
     if not signature.startswith("sha256="):
+        logger.warning(f"Signature doesn't start with sha256=: {signature[:20]}")
         return False
     expected = "sha256=" + hmac.new(
-        FACEBOOK_APP_SECRET.encode(),
+        FACEBOOK_APP_SECRET.encode("utf-8"),
         body,
         hashlib.sha256,
     ).hexdigest()
     match = hmac.compare_digest(signature, expected)
     if not match:
-        # Log mismatch for debugging — TODO remove in production
-        logger.warning(f"Signature mismatch: got {signature[:30]}... expected {expected[:30]}...")
-    return True  # TEMP: accept all webhooks while debugging secret
+        logger.warning(
+            f"Signature MISMATCH — got={signature[:40]}... "
+            f"expected={expected[:40]}... "
+            f"secret_len={len(FACEBOOK_APP_SECRET)} body_len={len(body)}"
+        )
+    else:
+        logger.info("Webhook signature verified OK")
+    return match
 
 
 # ---------------------------------------------------------------------------
