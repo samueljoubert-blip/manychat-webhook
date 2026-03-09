@@ -724,7 +724,25 @@ async def process_incoming_message(sender_psid: str, page_id: str,
             return
         # If neither yes/no, treat as keyword (fall through)
 
-    # 3. Smart recipe matching — Fuzzy keyword lookup
+    # 3. Test keyword — for testing without ManyChat interference
+    if text_lower == "testcdg":
+        test_recipe = {
+            "title": "TEST — Many Coup de Grace fonctionne!",
+            "url": "https://lecoupdegrace.ca",
+            "keyword": "testcdg",
+            "image_url": "",
+        }
+        await send_text_message(
+            sender_psid,
+            "🎉 BRAVO ! Many Coup de Grace fonctionne parfaitement !\n\n"
+            "Ce message vient de TON serveur, pas de ManyChat.\n"
+            "Tu peux maintenant annuler ton abonnement ManyChat! 💪",
+            platform,
+        )
+        log_message(sub_id, "outgoing", "TEST keyword success", platform=platform)
+        return
+
+    # 4. Smart recipe matching — Fuzzy keyword lookup
     recipe = fuzzy_lookup_recipe(message_text)
 
     if recipe:
