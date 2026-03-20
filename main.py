@@ -848,7 +848,12 @@ async def webhook_receive(request: Request):
     Meta Webhook message receiver (POST).
     Receives incoming messages from Instagram and Facebook Messenger.
     Must respond 200 OK within 20 seconds.
+    TEMPORAIREMENT DÉSACTIVÉ — Sam 2026-03-20
     """
+    logger.warning("⚠️ WEBHOOK DÉSACTIVÉ — requête ignorée")
+    return PlainTextResponse(content="EVENT_RECEIVED", status_code=200)
+
+    # --- DÉBUT CODE DÉSACTIVÉ ---
     # Verify signature
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
