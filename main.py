@@ -1084,6 +1084,7 @@ async def root():
     return {"status": "ok", "service": "Many Coup de Grace — lecoupdegrace.ca", "version": "3.0.0"}
 
 
+@app.head("/health")
 @app.get("/health")
 async def health():
     try:
