@@ -848,13 +848,11 @@ async def webhook_receive(request: Request):
     Meta Webhook message receiver (POST).
     Receives incoming messages from Instagram and Facebook Messenger.
     Must respond 200 OK within 20 seconds.
-    TEMPORAIREMENT DÉSACTIVÉ — Sam 2026-03-20
+    MODE TEST ONLY — seuls testcdg et testlcdg2026 sont traités
     """
-    logger.warning("⚠️ WEBHOOK DÉSACTIVÉ — requête ignorée")
-    return PlainTextResponse(content="EVENT_RECEIVED", status_code=200)
+    # TEST_ONLY_KEYWORDS — only these keywords will be processed
+    TEST_ONLY_KEYWORDS = {"testcdg", "testlcdg2026"}
 
-    # --- DÉBUT CODE DÉSACTIVÉ ---
-    # Verify signature
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
     if not verify_signature(body, signature):
@@ -862,13 +860,13 @@ async def webhook_receive(request: Request):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     data = await request.json()
-    logger.info(f"Webhook received: {data}")
+    logger.info(f"Webhook received (TEST MODE): {data}")
 
     # Determine platform from the object field
     obj = data.get("object", "")
     platform = "instagram" if obj == "instagram" else "facebook"
 
-    # Process each entry
+    # Process each entry — TEST MODE: only process test keywords
     for entry in data.get("entry", []):
 
         # --- DM messages (Instagram + Facebook Messenger) ---
@@ -885,6 +883,10 @@ async def webhook_receive(request: Request):
                 message_text = event["message"]["text"]
                 # Don't respond to echoes (messages we sent)
                 if event["message"].get("is_echo"):
+                    continue
+                # TEST MODE: only respond to test keywords
+                if message_text.strip().lower() not in TEST_ONLY_KEYWORDS:
+                    logger.info(f"TEST MODE: ignoring DM '{message_text}' (not a test keyword)")
                     continue
                 await process_incoming_message(sender_psid, page_id, message_text, platform)
 
@@ -906,6 +908,10 @@ async def webhook_receive(request: Request):
                 comment_text = value.get("text", "")
                 commenter_id = value.get("from", {}).get("id", "")
                 media_id = value.get("media", {}).get("id", "")
+                # TEST MODE: only respond to test keywords
+                if comment_text.strip().lower() not in TEST_ONLY_KEYWORDS:
+                    logger.info(f"TEST MODE: ignoring IG comment '{comment_text}' (not a test keyword)")
+                    continue
                 if comment_id and commenter_id and comment_text:
                     await process_comment(comment_id, commenter_id, comment_text,
                                           media_id, platform)
@@ -916,6 +922,10 @@ async def webhook_receive(request: Request):
                 comment_text = value.get("message", "")
                 commenter_id = value.get("from", {}).get("id", "")
                 post_id = value.get("post_id", "")
+                # TEST MODE: only respond to test keywords
+                if comment_text.strip().lower() not in TEST_ONLY_KEYWORDS:
+                    logger.info(f"TEST MODE: ignoring FB comment '{comment_text}' (not a test keyword)")
+                    continue
                 if comment_id and commenter_id and comment_text:
                     await process_comment(comment_id, commenter_id, comment_text,
                                           post_id, "facebook")
