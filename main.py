@@ -395,10 +395,11 @@ async def reply_to_comment(comment_id: str, platform: str = "instagram"):
         return resp.json() if resp.status_code == 200 else None
 
 
-async def send_dm_from_comment(user_id: str, recipe: dict, platform: str = "instagram"):
+async def send_dm_from_comment(user_id: str, recipe: dict, platform: str = "instagram",
+                               comment_id: str = None):
     """Send a DM to someone who commented a keyword on a post."""
-    # Send the recipe card via DM
-    result = await send_recipe_card(user_id, recipe, platform)
+    # Send the recipe card via DM (use comment_id for Instagram Private Reply)
+    result = await send_recipe_card(user_id, recipe, platform, comment_id=comment_id)
     if result:
         logger.info(f"Sent DM recipe '{recipe['keyword']}' to commenter {user_id} on {platform}")
     return result
@@ -421,6 +422,7 @@ async def process_comment(comment_id: str, commenter_id: str, comment_text: str,
             "Ce message vient de TON serveur, pas de ManyChat.\n"
             "Tu peux maintenant annuler ton abonnement ManyChat! 💪",
             platform,
+            comment_id=comment_id,
         )
         logger.info("TEST comment keyword matched — replied + DM sent")
         return
@@ -438,8 +440,8 @@ async def process_comment(comment_id: str, commenter_id: str, comment_text: str,
         # 1. Reply publicly to the comment (random message)
         await reply_to_comment(comment_id, platform)
 
-        # 2. Send DM with the recipe
-        await send_dm_from_comment(commenter_id, recipe, platform)
+        # 2. Send DM with the recipe (pass comment_id for Instagram Private Reply)
+        await send_dm_from_comment(commenter_id, recipe, platform, comment_id=comment_id)
 
         # 3. Register as subscriber
         sub_id = upsert_subscriber(commenter_id, platform)
@@ -542,19 +544,28 @@ def set_broadcast_optin(psid: str, platform: str, opted_in: bool):
 # ---------------------------------------------------------------------------
 # Meta Graph API — Send Messages
 # ---------------------------------------------------------------------------
-async def send_text_message(psid: str, text: str, platform: str = "instagram"):
-    """Send a plain text message via Meta Send API."""
+async def send_text_message(psid: str, text: str, platform: str = "instagram",
+                            comment_id: str = None):
+    """Send a plain text message via Meta Send API.
+    If comment_id is provided, uses Private Reply (DM initiated from a comment).
+    """
     token = INSTAGRAM_PAGE_ACCESS_TOKEN if platform == "instagram" else FACEBOOK_PAGE_ACCESS_TOKEN
     if not token:
         logger.error(f"No access token for platform {platform}")
         return None
+
+    # Use comment_id as recipient for Instagram Private Replies (DM from comment)
+    if comment_id and platform == "instagram":
+        recipient = {"comment_id": comment_id}
+    else:
+        recipient = {"id": psid}
 
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             f"{GRAPH_API_BASE}/me/messages",
             params={"access_token": token},
             json={
-                "recipient": {"id": psid},
+                "recipient": recipient,
                 "messaging_type": "RESPONSE",
                 "message": {"text": text},
             },
@@ -566,8 +577,11 @@ async def send_text_message(psid: str, text: str, platform: str = "instagram"):
         return resp.json() if resp.status_code == 200 else None
 
 
-async def send_recipe_card(psid: str, recipe: dict, platform: str = "instagram"):
-    """Send a rich recipe card (Generic Template) via Meta Send API."""
+async def send_recipe_card(psid: str, recipe: dict, platform: str = "instagram",
+                           comment_id: str = None):
+    """Send a rich recipe card (Generic Template) via Meta Send API.
+    If comment_id is provided, uses Private Reply (DM initiated from a comment).
+    """
     token = INSTAGRAM_PAGE_ACCESS_TOKEN if platform == "instagram" else FACEBOOK_PAGE_ACCESS_TOKEN
     if not token:
         logger.error(f"No access token for platform {platform}")
@@ -599,12 +613,18 @@ async def send_recipe_card(psid: str, recipe: dict, platform: str = "instagram")
         }
     }
 
+    # Use comment_id as recipient for Instagram Private Replies (DM from comment)
+    if comment_id and platform == "instagram":
+        recipient = {"comment_id": comment_id}
+    else:
+        recipient = {"id": psid}
+
     async with httpx.AsyncClient(timeout=15) as client:
         resp = await client.post(
             f"{GRAPH_API_BASE}/me/messages",
             params={"access_token": token},
             json={
-                "recipient": {"id": psid},
+                "recipient": recipient,
                 "messaging_type": "RESPONSE",
                 "message": message,
             },
@@ -613,7 +633,7 @@ async def send_recipe_card(psid: str, recipe: dict, platform: str = "instagram")
             logger.error(f"Send recipe card failed: {resp.status_code} {resp.text}")
             # Fallback to text if template fails (Instagram sometimes doesn't support templates)
             fallback_text = f"{recipe['title']}\n\n{recipe['url']}"
-            return await send_text_message(psid, fallback_text, platform)
+            return await send_text_message(psid, fallback_text, platform, comment_id=comment_id)
         else:
             logger.info(f"Sent recipe card '{recipe['keyword']}' to {psid} on {platform}")
         return resp.json() if resp.status_code == 200 else None
