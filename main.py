@@ -99,8 +99,8 @@ def _already_processed(comment_id: str) -> bool:
 # ---------------------------------------------------------------------------
 # Bible CSV sync — keeps bible.db up-to-date from Google Sheets
 # ---------------------------------------------------------------------------
-def _parse_bible_csv(csv_text: str) -> list[dict]:
-    """Parse le CSV de la Bible en liste de dicts (colonnes lowercase, nettoyées)."""
+def _parse_bible_csv(csv_text: str):
+    """Génère les rangées du CSV Bible une à une (colonnes lowercase, nettoyées). Streaming = faible mémoire."""
     csv_text = csv_text.lstrip("﻿")
 
     lines = csv_text.split("\n")
@@ -122,9 +122,10 @@ def _parse_bible_csv(csv_text: str) -> list[dict]:
         except Exception:
             pass
 
+    # Sam 2026-06-28: générateur (yield) au lieu de bâtir la liste complète en mémoire.
+    # Évite de garder 2000+ rangées × 368 colonnes simultanément (cause OOM sur Render free 512MB).
     f = io.StringIO(csv_text)
     reader = csv.DictReader(f, skipinitialspace=True)
-    rows: list[dict] = []
     for r in reader:
         clean = {}
         for k, v in (r or {}).items():
@@ -135,8 +136,7 @@ def _parse_bible_csv(csv_text: str) -> list[dict]:
             val = " ".join(val.split())
             val = html.unescape(val)
             clean[kk] = val
-        rows.append(clean)
-    return rows
+        yield clean
 
 
 def _get_field(row: dict, *keys: str) -> str:
@@ -160,11 +160,6 @@ def sync_bible_from_csv():
         raw_csv = resp.text
     except Exception as e:
         logger.error(f"Bible sync: CSV download failed: {e}")
-        return
-
-    rows_data = _parse_bible_csv(raw_csv)
-    if not rows_data:
-        logger.warning("Bible sync: CSV parsed 0 rows — skipping update")
         return
 
     try:
@@ -197,7 +192,8 @@ def sync_bible_from_csv():
         synced = 0
         now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
-        for row in rows_data:
+        # Streaming: parse + insère rangée par rangée (pas de liste complète en mémoire)
+        for row in _parse_bible_csv(raw_csv):
             title = _get_field(row, "title", "titre recette", "titre", "name")
             url = _get_field(row, "permalink", "url recette", "url", "link")
             if not title or not url:
@@ -246,10 +242,21 @@ def sync_bible_from_csv():
         total_fr = conn.execute("SELECT COUNT(*) FROM recipes WHERE wpml_lang='fr'").fetchone()[0]
         conn.close()
 
-        logger.info(f"Bible sync OK: {synced} rows synced, {kw_count} keywords FR, {total_fr} total FR")
+        if synced == 0:
+            logger.warning("Bible sync: 0 rangée synchronisée (CSV vide/malformé?) — bible.db inchangée")
+        else:
+            logger.info(f"Bible sync OK: {synced} rows synced, {kw_count} keywords FR, {total_fr} total FR")
 
     except Exception as e:
         logger.error(f"Bible sync: DB update failed: {e}")
+    finally:
+        # Libère le gros texte CSV + force le GC (Render free = 512MB)
+        try:
+            del raw_csv
+        except Exception:
+            pass
+        import gc
+        gc.collect()
 
 
 def _bible_sync_loop():
