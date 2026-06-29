@@ -55,6 +55,12 @@ WEBHOOK_VERIFY_TOKEN = os.getenv("WEBHOOK_VERIFY_TOKEN", "").strip()
 FACEBOOK_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET", "").strip()
 # Sam 2026-06-28: rejet strict des signatures invalides (à activer une fois confirmé OK dans les logs)
 STRICT_SIGNATURE = os.getenv("STRICT_SIGNATURE", "false").strip().lower() in ("1", "true", "yes", "on")
+
+# Sam 2026-06-28: pendant la transition (ManyChat payant ENCORE actif), répondre SEULEMENT
+# aux keywords de démo pour éviter les DOUBLES DM (un de ManyChat + un de l'interne).
+# Mettre TEST_KEYWORDS_ONLY=false dans Render UNE FOIS la review approuvée + ManyChat coupé.
+TEST_KEYWORDS_ONLY = os.getenv("TEST_KEYWORDS_ONLY", "true").strip().lower() in ("1", "true", "yes", "on")
+DEMO_KEYWORDS = {"testcdg", "testlcdg2026"}
 FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
 # Instagram uses same Page token by default (same FB Page linked to IG account)
 INSTAGRAM_PAGE_ACCESS_TOKEN = (os.getenv("INSTAGRAM_PAGE_ACCESS_TOKEN", "").strip()
@@ -663,6 +669,13 @@ async def process_comment(comment_id: str, commenter_id: str, comment_text: str,
             logger.warning("DEMO 'testcdg' — recette tiramisulegendaire introuvable dans bible.db")
         return
 
+    # 🚦 TRANSITION (Sam 2026-06-28): tant que ManyChat payant est actif, ne PAS répondre
+    # aux vrais keywords (ManyChat les gère) pour éviter le double DM. Seuls les keywords
+    # de démo passent (gérés au-dessus). Flip TEST_KEYWORDS_ONLY=false après review + coupure ManyChat.
+    if TEST_KEYWORDS_ONLY:
+        logger.info(f"[{platform}] TEST_KEYWORDS_ONLY actif — '{comment_text}' laissé à ManyChat (pas de double DM)")
+        return
+
     # Try to match a recipe keyword (fuzzy)
     recipe = fuzzy_lookup_recipe(comment_text)
 
@@ -1033,6 +1046,12 @@ async def process_incoming_message(sender_psid: str, page_id: str,
             platform,
         )
         log_message(sub_id, "outgoing", "TEST keyword success", platform=platform)
+        return
+
+    # 🚦 TRANSITION (Sam 2026-06-28): ManyChat payant encore actif → ne pas répondre
+    # aux vrais keywords en DM non plus (évite le double). Flip TEST_KEYWORDS_ONLY=false après coupure.
+    if TEST_KEYWORDS_ONLY:
+        logger.info(f"[{platform}] TEST_KEYWORDS_ONLY actif (DM) — '{message_text}' laissé à ManyChat")
         return
 
     # 4. Smart recipe matching — Fuzzy keyword lookup
