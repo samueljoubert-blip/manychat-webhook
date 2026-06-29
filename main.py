@@ -7,11 +7,16 @@ avec la recette (carte riche avec image + bouton).
 
 import os
 import re
+import csv
+import io
 import hmac
 import hashlib
 import random
 import sqlite3
 import logging
+import html
+import threading
+import time
 import unicodedata
 from datetime import datetime, timezone
 from pathlib import Path
@@ -40,8 +45,16 @@ logger = logging.getLogger("many-cdg")
 DB_PATH = Path(os.getenv("BIBLE_DB_PATH", "./bible.db"))
 SUBSCRIBERS_DB_PATH = Path(os.getenv("SUBSCRIBERS_DB_PATH", "./subscribers.db"))
 
+BIBLE_CSV_URL = os.getenv(
+    "BIBLE_CSV_URL",
+    "https://docs.google.com/spreadsheets/d/e/2PACX-1vSJy0EObwLLNwuKZJ2l9SUGSQHbM-QOgO2BzW4lGVgORPloFjiCbMeG_hHvDx_szLivAQYPNW6wdY08/pub?output=csv",
+)
+BIBLE_SYNC_INTERVAL = int(os.getenv("BIBLE_SYNC_INTERVAL", "7200"))  # 2 hours
+
 WEBHOOK_VERIFY_TOKEN = os.getenv("WEBHOOK_VERIFY_TOKEN", "").strip()
 FACEBOOK_APP_SECRET = os.getenv("FACEBOOK_APP_SECRET", "").strip()
+# Sam 2026-06-28: rejet strict des signatures invalides (à activer une fois confirmé OK dans les logs)
+STRICT_SIGNATURE = os.getenv("STRICT_SIGNATURE", "false").strip().lower() in ("1", "true", "yes", "on")
 FACEBOOK_PAGE_ACCESS_TOKEN = os.getenv("FACEBOOK_PAGE_ACCESS_TOKEN", "").strip()
 # Instagram uses same Page token by default (same FB Page linked to IG account)
 INSTAGRAM_PAGE_ACCESS_TOKEN = (os.getenv("INSTAGRAM_PAGE_ACCESS_TOKEN", "").strip()
@@ -49,6 +62,198 @@ INSTAGRAM_PAGE_ACCESS_TOKEN = (os.getenv("INSTAGRAM_PAGE_ACCESS_TOKEN", "").stri
 
 GRAPH_API_VERSION = "v21.0"
 GRAPH_API_BASE = f"https://graph.facebook.com/{GRAPH_API_VERSION}"
+
+# --- Anti-boucle (Sam 2026-06-28) ---
+# IDs de la page elle-même: quand la page poste une réponse publique, Meta renvoie
+# un event de commentaire avec from.id = page id. Sans ce filtre → boucle infinie.
+FB_PAGE_ID = os.getenv("FB_PAGE_ID", "638843516189568").strip()
+IG_PAGE_ID = os.getenv("IG_PAGE_ID", "17841401702950117").strip()
+SELF_IDS = {x for x in (FB_PAGE_ID, IG_PAGE_ID) if x}
+
+# Dedup des commentaires déjà traités (anti-boucle + livraisons multiples Meta).
+import time as _time
+_PROCESSED_COMMENTS: dict = {}
+_PROCESSED_TTL = 600  # 10 min
+
+
+def _already_processed(comment_id: str) -> bool:
+    """True si ce comment_id a déjà été traité récemment (idempotence)."""
+    now = _time.time()
+    if len(_PROCESSED_COMMENTS) > 5000:
+        for k, t in list(_PROCESSED_COMMENTS.items()):
+            if now - t > _PROCESSED_TTL:
+                _PROCESSED_COMMENTS.pop(k, None)
+    last = _PROCESSED_COMMENTS.get(comment_id)
+    if last is not None and now - last < _PROCESSED_TTL:
+        return True
+    _PROCESSED_COMMENTS[comment_id] = now
+    return False
+
+
+# ---------------------------------------------------------------------------
+# Bible CSV sync — keeps bible.db up-to-date from Google Sheets
+# ---------------------------------------------------------------------------
+def _parse_bible_csv(csv_text: str) -> list[dict]:
+    """Parse le CSV de la Bible en liste de dicts (colonnes lowercase, nettoyées)."""
+    csv_text = csv_text.lstrip("﻿")
+
+    lines = csv_text.split("\n")
+    if lines:
+        header_reader = csv.reader([lines[0]])
+        try:
+            raw_headers = next(header_reader)
+            fixed = False
+            for i, h_val in enumerate(raw_headers):
+                h_clean = h_val.strip().strip('"').strip()
+                if h_clean.isdigit():
+                    raw_headers[i] = "Title"
+                    fixed = True
+            if fixed:
+                buf = io.StringIO()
+                csv.writer(buf).writerow(raw_headers)
+                lines[0] = buf.getvalue().rstrip("\r\n")
+                csv_text = "\n".join(lines)
+        except Exception:
+            pass
+
+    f = io.StringIO(csv_text)
+    reader = csv.DictReader(f, skipinitialspace=True)
+    rows: list[dict] = []
+    for r in reader:
+        clean = {}
+        for k, v in (r or {}).items():
+            kk = (k or "").strip().lower().lstrip("﻿").rstrip().strip()
+            kk = kk.strip('"').strip("'").strip()
+            val = (v or "").strip()
+            val = val.replace("\r\n", " ").replace("\n", " ").replace("\r", " ")
+            val = " ".join(val.split())
+            val = html.unescape(val)
+            clean[kk] = val
+        rows.append(clean)
+    return rows
+
+
+def _get_field(row: dict, *keys: str) -> str:
+    """Get first non-empty value matching any of the given column names."""
+    for k in keys:
+        v = row.get(k.strip().lower())
+        if v is not None and str(v).strip():
+            return str(v).strip()
+    return ""
+
+
+def sync_bible_from_csv():
+    """
+    Télécharge le CSV Bible depuis Google Sheets et met à jour bible.db.
+    En cas d'erreur, l'ancienne bible.db reste intacte.
+    """
+    try:
+        logger.info("Bible sync: fetching CSV from Google Sheets...")
+        resp = httpx.Client(timeout=60, follow_redirects=True).get(BIBLE_CSV_URL)
+        resp.raise_for_status()
+        raw_csv = resp.text
+    except Exception as e:
+        logger.error(f"Bible sync: CSV download failed: {e}")
+        return
+
+    rows_data = _parse_bible_csv(raw_csv)
+    if not rows_data:
+        logger.warning("Bible sync: CSV parsed 0 rows — skipping update")
+        return
+
+    try:
+        conn = sqlite3.connect(str(DB_PATH))
+        conn.row_factory = sqlite3.Row
+        conn.execute("PRAGMA journal_mode=WAL")
+
+        # Ensure table exists
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS recipes (
+                id INTEGER PRIMARY KEY,
+                title TEXT NOT NULL,
+                url TEXT UNIQUE NOT NULL,
+                slug TEXT DEFAULT '',
+                keyword TEXT DEFAULT '',
+                image_url TEXT DEFAULT '',
+                categories TEXT DEFAULT '',
+                tags TEXT DEFAULT '',
+                prep_time INTEGER DEFAULT 0,
+                cook_time INTEGER DEFAULT 0,
+                wpml_lang TEXT DEFAULT 'fr',
+                wpml_translation_id TEXT DEFAULT '',
+                status TEXT DEFAULT 'published',
+                synced_at TEXT DEFAULT CURRENT_TIMESTAMP
+            )
+        """)
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recipes_keyword ON recipes(keyword)")
+        conn.execute("CREATE INDEX IF NOT EXISTS idx_recipes_lang ON recipes(wpml_lang)")
+
+        synced = 0
+        now_str = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        for row in rows_data:
+            title = _get_field(row, "title", "titre recette", "titre", "name")
+            url = _get_field(row, "permalink", "url recette", "url", "link")
+            if not title or not url:
+                continue
+
+            keyword = _get_field(row, "keywords manychat", "keyword", "keywords", "manychat")
+            image_url = _get_field(row, "a1", "attachment url", "image url", "image", "featured image")
+            if image_url and "|" in image_url:
+                image_url = image_url.split("|")[0].strip()
+
+            wpml_lang = _get_field(row, "wpml language code", "language", "lang").strip().lower() or "fr"
+            wpml_translation_id = _get_field(row, "wpml translation id", "wpml_translation_id")
+            categories = _get_field(row, "categories", "category")
+
+            status = _get_field(row, "status").lower()
+            if status and status not in ("published", "publish", ""):
+                continue
+
+            wp_id = _get_field(row, "id")
+
+            try:
+                conn.execute("""
+                    INSERT INTO recipes (id, title, url, keyword, image_url, categories,
+                        wpml_lang, wpml_translation_id, status, synced_at)
+                    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    ON CONFLICT(url) DO UPDATE SET
+                        title=excluded.title, keyword=excluded.keyword,
+                        image_url=excluded.image_url, categories=excluded.categories,
+                        wpml_lang=excluded.wpml_lang, wpml_translation_id=excluded.wpml_translation_id,
+                        status=excluded.status, synced_at=excluded.synced_at
+                """, (
+                    int(wp_id) if wp_id and wp_id.isdigit() else None,
+                    title, url, keyword, image_url, categories,
+                    wpml_lang, wpml_translation_id, status or "published", now_str,
+                ))
+                synced += 1
+            except Exception as row_err:
+                logger.debug(f"Bible sync: skip row '{title}': {row_err}")
+
+        conn.commit()
+
+        # Count keywords for log
+        kw_count = conn.execute(
+            "SELECT COUNT(*) FROM recipes WHERE wpml_lang='fr' AND keyword IS NOT NULL AND keyword != ''"
+        ).fetchone()[0]
+        total_fr = conn.execute("SELECT COUNT(*) FROM recipes WHERE wpml_lang='fr'").fetchone()[0]
+        conn.close()
+
+        logger.info(f"Bible sync OK: {synced} rows synced, {kw_count} keywords FR, {total_fr} total FR")
+
+    except Exception as e:
+        logger.error(f"Bible sync: DB update failed: {e}")
+
+
+def _bible_sync_loop():
+    """Background thread: sync bible every BIBLE_SYNC_INTERVAL seconds."""
+    while True:
+        time.sleep(BIBLE_SYNC_INTERVAL)
+        try:
+            sync_bible_from_csv()
+        except Exception as e:
+            logger.error(f"Bible sync loop error: {e}")
 
 
 # ---------------------------------------------------------------------------
@@ -112,6 +317,17 @@ def init_subscribers_db():
 @app.on_event("startup")
 async def startup():
     init_subscribers_db()
+
+    # Sync bible.db from Google Sheets CSV at startup
+    try:
+        sync_bible_from_csv()
+    except Exception as e:
+        logger.error(f"Startup bible sync failed (using existing bible.db): {e}")
+
+    # Background thread: re-sync every 2 hours
+    t = threading.Thread(target=_bible_sync_loop, daemon=True)
+    t.start()
+    logger.info(f"Bible sync background thread started (interval={BIBLE_SYNC_INTERVAL}s)")
 
 
 # ---------------------------------------------------------------------------
@@ -413,6 +629,17 @@ async def process_comment(comment_id: str, commenter_id: str, comment_text: str,
     """
     logger.info(f"[{platform}] Comment from {commenter_id} on {media_id}: {comment_text}")
 
+    # 🛡️ ANTI-BOUCLE (Sam 2026-06-28)
+    # 1. Ignorer les commentaires postés par la page elle-même (sa réponse publique
+    #    re-déclenchait un event → boucle de 800+ DMs le 20 mars 2026).
+    if commenter_id in SELF_IDS:
+        logger.info(f"[{platform}] Skip — commentaire de la page elle-même ({commenter_id})")
+        return
+    # 2. Idempotence — ne jamais traiter 2x le même commentaire (Meta livre en double).
+    if _already_processed(comment_id):
+        logger.info(f"[{platform}] Skip — commentaire déjà traité ({comment_id})")
+        return
+
     # Test keyword — for testing without ManyChat interference
     if comment_text.strip().lower() == "testcdg":
         await reply_to_comment(comment_id, platform)
@@ -666,8 +893,13 @@ def verify_signature(body: bytes, signature: str) -> bool:
             f"secret_len={len(FACEBOOK_APP_SECRET)} body_len={len(body)} "
             f"body_start={body[:80]}"
         )
-        # DEV MODE: accept anyway — re-enable strict check before production
-        logger.warning("DEV MODE: accepting webhook despite signature mismatch")
+        # Sam 2026-06-28: strict configurable. Mets STRICT_SIGNATURE=true dans Render
+        # SEULEMENT après avoir confirmé dans les logs que tu vois "signature verified OK"
+        # (sinon un bug d'encodage du body bloquerait TOUS les webhooks en 403).
+        if STRICT_SIGNATURE:
+            logger.error("STRICT mode: rejet du webhook (signature invalide)")
+            return False
+        logger.warning("DEV MODE: accepting webhook despite signature mismatch (STRICT_SIGNATURE=false)")
         return True
     else:
         logger.info("Webhook signature verified OK")
@@ -868,10 +1100,10 @@ async def webhook_receive(request: Request):
     Meta Webhook message receiver (POST).
     Receives incoming messages from Instagram and Facebook Messenger.
     Must respond 200 OK within 20 seconds.
-    MODE TEST ONLY — seuls testcdg et testlcdg2026 sont traités
+    PRODUCTION MODE — all keywords are processed.
     """
-    # TEST_ONLY_KEYWORDS — only these keywords will be processed
-    TEST_ONLY_KEYWORDS = {"testcdg", "testlcdg2026"}
+    # TEST_ONLY_KEYWORDS — DISABLED for production (was blocking all real keywords)
+    # TEST_ONLY_KEYWORDS = {"testcdg", "testlcdg2026"}
 
     body = await request.body()
     signature = request.headers.get("X-Hub-Signature-256", "")
@@ -880,13 +1112,13 @@ async def webhook_receive(request: Request):
         raise HTTPException(status_code=403, detail="Invalid signature")
 
     data = await request.json()
-    logger.info(f"Webhook received (TEST MODE): {data}")
+    logger.info(f"Webhook received: {data}")
 
     # Determine platform from the object field
     obj = data.get("object", "")
     platform = "instagram" if obj == "instagram" else "facebook"
 
-    # Process each entry — TEST MODE: only process test keywords
+    # Process each entry
     for entry in data.get("entry", []):
 
         # --- DM messages (Instagram + Facebook Messenger) ---
@@ -903,10 +1135,6 @@ async def webhook_receive(request: Request):
                 message_text = event["message"]["text"]
                 # Don't respond to echoes (messages we sent)
                 if event["message"].get("is_echo"):
-                    continue
-                # TEST MODE: only respond to test keywords
-                if message_text.strip().lower() not in TEST_ONLY_KEYWORDS:
-                    logger.info(f"TEST MODE: ignoring DM '{message_text}' (not a test keyword)")
                     continue
                 await process_incoming_message(sender_psid, page_id, message_text, platform)
 
@@ -928,23 +1156,22 @@ async def webhook_receive(request: Request):
                 comment_text = value.get("text", "")
                 commenter_id = value.get("from", {}).get("id", "")
                 media_id = value.get("media", {}).get("id", "")
-                # TEST MODE: only respond to test keywords
-                if comment_text.strip().lower() not in TEST_ONLY_KEYWORDS:
-                    logger.info(f"TEST MODE: ignoring IG comment '{comment_text}' (not a test keyword)")
-                    continue
                 if comment_id and commenter_id and comment_text:
                     await process_comment(comment_id, commenter_id, comment_text,
                                           media_id, platform)
 
             # Facebook feed comments
             elif field == "feed" and value.get("item") == "comment":
+                # Seulement les nouveaux commentaires — ignorer edit/remove/hide (anti-boucle)
+                verb = value.get("verb")
+                if verb and verb != "add":
+                    continue
                 comment_id = value.get("comment_id", "")
                 comment_text = value.get("message", "")
                 commenter_id = value.get("from", {}).get("id", "")
                 post_id = value.get("post_id", "")
-                # TEST MODE: only respond to test keywords
-                if comment_text.strip().lower() not in TEST_ONLY_KEYWORDS:
-                    logger.info(f"TEST MODE: ignoring FB comment '{comment_text}' (not a test keyword)")
+                # Filet supplémentaire: ne pas traiter la réponse publique de la page
+                if commenter_id and commenter_id in SELF_IDS:
                     continue
                 if comment_id and commenter_id and comment_text:
                     await process_comment(comment_id, commenter_id, comment_text,
