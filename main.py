@@ -641,17 +641,26 @@ async def process_comment(comment_id: str, commenter_id: str, comment_text: str,
         return
 
     # Test keyword — for testing without ManyChat interference
+    # Keyword de démo/review (Sam 2026-06-28): UNIQUE à l'interne (pas dans ManyChat payant,
+    # donc 1 seul DM, pas de double). Livre une VRAIE recette avec lien pour la vidéo App Review.
     if comment_text.strip().lower() == "testcdg":
         await reply_to_comment(comment_id, platform)
-        await send_text_message(
-            commenter_id,
-            "🎉 BRAVO ! Many Coup de Grace fonctionne parfaitement !\n\n"
-            "Ce message vient de TON serveur, pas de ManyChat.\n"
-            "Tu peux maintenant annuler ton abonnement ManyChat! 💪",
-            platform,
-            comment_id=comment_id,
-        )
-        logger.info("TEST comment keyword matched — replied + DM sent")
+        demo_recipe = lookup_recipe("tiramisulegendaire")
+        if demo_recipe:
+            await send_dm_from_comment(commenter_id, demo_recipe, platform, comment_id=comment_id)
+            sub_id = upsert_subscriber(commenter_id, platform)
+            log_message(sub_id, "incoming", f"[COMMENT] {comment_text}",
+                        keyword_matched="testcdg", platform=platform)
+            log_message(sub_id, "outgoing", f"[COMMENT REPLY+DM] {demo_recipe['title']}",
+                        keyword_matched="testcdg", platform=platform)
+            logger.info("DEMO comment 'testcdg' — replied + recipe DM sent")
+        else:
+            await send_text_message(
+                commenter_id,
+                "🎉 Many Coup de Grace fonctionne ! (recette de démo introuvable)",
+                platform, comment_id=comment_id,
+            )
+            logger.warning("DEMO 'testcdg' — recette tiramisulegendaire introuvable dans bible.db")
         return
 
     # Try to match a recipe keyword (fuzzy)
